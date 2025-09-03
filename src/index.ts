@@ -13,6 +13,70 @@ const server = new McpServer({
 let mongoClient: MongoClient | null = null;
 let databases: Map<string, Db> = new Map();
 
+function truncateForOutput(obj: unknown, maxOutputLength: number = 25000): unknown {
+  const estimatedSize = JSON.stringify(obj).length;
+  if (estimatedSize <= maxOutputLength) {
+    return obj;
+  }
+
+  function truncateValue(value: unknown): unknown {
+    if (typeof value === "string" && value.length > 200) {
+      const truncated = value.slice(0, 200);
+      const remaining = value.length - 200;
+      return `${truncated}...${remaining} more characters`;
+    }
+
+    if (Array.isArray(value)) {
+      if (value.length <= 1) {
+        return value.map((item) => truncateValue(item));
+      }
+      const firstItem = truncateValue(value[0]);
+      const remaining = value.length - 1;
+      return [firstItem, `...${remaining} more items`];
+    }
+
+    if (typeof value === "object" && value !== null) {
+      const keys = Object.keys(value);
+      if (keys.length <= 200) {
+        const result: Record<string, unknown> = {};
+        for (const key of keys) {
+          result[key] = truncateValue((value as Record<string, unknown>)[key]);
+        }
+        return result;
+      }
+
+      const result: Record<string, unknown> = {};
+      const firstKeys = keys.slice(0, 200);
+      for (const key of firstKeys) {
+        result[key] = truncateValue((value as Record<string, unknown>)[key]);
+      }
+      const remaining = keys.length - 200;
+      result[`...${remaining} more properties`] = "...";
+      return result;
+    }
+
+    return value;
+  }
+
+  return truncateValue(obj);
+}
+
+function formatJsonOutput(data: unknown): string {
+  const truncatedData = truncateForOutput(data);
+  let outputText = JSON.stringify(truncatedData, null, 2);
+  
+  outputText = outputText.replace(
+    /"\.\.\.(\d+) more items"/g,
+    "...$1 more items"
+  );
+  outputText = outputText.replace(
+    /"\.\.\.(\d+) more properties": "\.\.\.?"/g,
+    "...$1 more properties"
+  );
+  
+  return outputText;
+}
+
 function getMongoUri(): string {
   const uri = process.env.MONGODB_URI;
   if (!uri) {
@@ -85,11 +149,13 @@ server.tool(
       
       const documents = await cursor.toArray();
       
+      const formattedOutput = formatJsonOutput(documents);
+      
       return {
         content: [
           {
             type: "text",
-            text: `Found ${documents.length} document(s):\n${JSON.stringify(documents, null, 2)}`,
+            text: `Found ${documents.length} document(s):\n\n${formattedOutput}`,
           },
         ],
       };
@@ -179,11 +245,13 @@ server.tool(
       
       const documents = await collection.aggregate(pipeline).toArray();
       
+      const formattedOutput = formatJsonOutput(documents);
+      
       return {
         content: [
           {
             type: "text",
-            text: `Aggregation returned ${documents.length} document(s):\n${JSON.stringify(documents, null, 2)}`,
+            text: `Aggregation returned ${documents.length} document(s):\n\n${formattedOutput}`,
           },
         ],
       };
