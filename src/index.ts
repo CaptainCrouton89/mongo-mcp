@@ -3,106 +3,257 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-// Create the MCP server
+import { MongoClient, Db, Collection } from "mongodb";
+
 const server = new McpServer({
-  name: "hello-world",
+  name: "mongo-mcp",
   version: "1.0.0",
 });
 
-// Tool: Store conversation with embeddings
-server.tool(
-  "hello-world",
-  "Say hello to the user",
-  {
-    name: z.string().describe("The name of the user"),
-  },
-  async ({ name }) => {
-    const response = `Hello ${name}`;
+let mongoClient: MongoClient | null = null;
+let databases: Map<string, Db> = new Map();
 
-    return {
-      content: [
-        {
-          type: "text",
-          text: response,
-        },
-      ],
-    };
+function getMongoUri(): string {
+  const uri = process.env.MONGODB_URI;
+  if (!uri) {
+    throw new Error("MONGODB_URI environment variable is not set");
   }
-);
-
-server.tool(
-  "get-mcp-docs",
-  "Make an MCP server",
-  {
-    name: z.string().describe("The name of the MCP server"),
-  },
-  async ({ name }) => {
-    const response = `
-# Main file for the MCP server
-
-\`\`\`ts
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { z } from "zod";
-// Create the MCP server
-const server = new McpServer({
-  name: "hello-world",
-  version: "1.0.0",
-});
-
-// Tool: Store conversation with embeddings
-server.tool(
-  "hello-world",
-  "Say hello to the user",
-  {
-    name: z.string().describe("The name of the user"),
-  },
-  async ({ name }) => {
-    const response = \`Hello ${name}\`;
-
-    return {
-      content: [
-        {
-          type: "text",
-          text: response,
-        },
-      ],
-    };
-  }
-);
-
-// Start the server
-async function main() {
-  try {
-    const transport = new StdioServerTransport();
-    await server.connect(transport);
-    console.error("MCP Hello World Server running...");
-  } catch (error) {
-    console.error("Error starting server:", error);
-    process.exit(1);
-  }
+  return uri;
 }
 
-main().catch(console.error);
-\`\`\`
-`;
-    return {
-      content: [
-        {
-          type: "text",
-          text: response,
-        },
-      ],
-    };
+async function ensureConnection(dbName: string): Promise<Db> {
+  if (!mongoClient) {
+    const uri = getMongoUri();
+    mongoClient = new MongoClient(uri);
+    await mongoClient.connect();
+  }
+  
+  if (!databases.has(dbName)) {
+    databases.set(dbName, mongoClient.db(dbName));
+  }
+  
+  return databases.get(dbName)!;
+}
+
+server.tool(
+  "mongo-create-document",
+  "Create a new document in a MongoDB collection",
+  {
+    database: z.string().describe("Database name"),
+    collection: z.string().describe("Collection name"),
+    document: z.record(z.any()).describe("Document to insert as JSON object"),
+  },
+  async ({ database: dbName, collection: collectionName, document }) => {
+    try {
+      const db = await ensureConnection(dbName);
+      const collection: Collection = db.collection(collectionName);
+      
+      const result = await collection.insertOne(document);
+      
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Document created successfully with ID: ${result.insertedId}`,
+          },
+        ],
+      };
+    } catch (error) {
+      throw new Error(`Failed to create document: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
   }
 );
 
-// Start the server
+server.tool(
+  "mongo-find-documents",
+  "Query documents from a MongoDB collection",
+  {
+    database: z.string().describe("Database name"),
+    collection: z.string().describe("Collection name"),
+    filter: z.record(z.any()).optional().describe("Query filter as JSON object (optional)"),
+    limit: z.number().optional().describe("Maximum number of documents to return (optional)"),
+  },
+  async ({ database: dbName, collection: collectionName, filter = {}, limit }) => {
+    try {
+      const db = await ensureConnection(dbName);
+      const collection: Collection = db.collection(collectionName);
+      
+      let cursor = collection.find(filter);
+      if (limit) {
+        cursor = cursor.limit(limit);
+      }
+      
+      const documents = await cursor.toArray();
+      
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Found ${documents.length} document(s):\n${JSON.stringify(documents, null, 2)}`,
+          },
+        ],
+      };
+    } catch (error) {
+      throw new Error(`Failed to find documents: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  }
+);
+
+server.tool(
+  "mongo-update-document",
+  "Update documents in a MongoDB collection",
+  {
+    database: z.string().describe("Database name"),
+    collection: z.string().describe("Collection name"),
+    filter: z.record(z.any()).describe("Query filter to match documents to update"),
+    update: z.record(z.any()).describe("Update operations as JSON object"),
+    updateMany: z.boolean().optional().describe("Whether to update multiple documents (default: false)"),
+  },
+  async ({ database: dbName, collection: collectionName, filter, update, updateMany = false }) => {
+    try {
+      const db = await ensureConnection(dbName);
+      const collection: Collection = db.collection(collectionName);
+      
+      const result = updateMany 
+        ? await collection.updateMany(filter, update)
+        : await collection.updateOne(filter, update);
+      
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Update operation completed. Matched: ${result.matchedCount}, Modified: ${result.modifiedCount}`,
+          },
+        ],
+      };
+    } catch (error) {
+      throw new Error(`Failed to update document(s): ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  }
+);
+
+server.tool(
+  "mongo-delete-document",
+  "Delete documents from a MongoDB collection",
+  {
+    database: z.string().describe("Database name"),
+    collection: z.string().describe("Collection name"),
+    filter: z.record(z.any()).describe("Query filter to match documents to delete"),
+    deleteMany: z.boolean().optional().describe("Whether to delete multiple documents (default: false)"),
+  },
+  async ({ database: dbName, collection: collectionName, filter, deleteMany = false }) => {
+    try {
+      const db = await ensureConnection(dbName);
+      const collection: Collection = db.collection(collectionName);
+      
+      const result = deleteMany
+        ? await collection.deleteMany(filter)
+        : await collection.deleteOne(filter);
+      
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Delete operation completed. Deleted ${result.deletedCount} document(s)`,
+          },
+        ],
+      };
+    } catch (error) {
+      throw new Error(`Failed to delete document(s): ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  }
+);
+
+server.tool(
+  "mongo-aggregate",
+  "Execute aggregation pipeline on a MongoDB collection",
+  {
+    database: z.string().describe("Database name"),
+    collection: z.string().describe("Collection name"),
+    pipeline: z.array(z.record(z.any())).describe("Aggregation pipeline as array of stage objects"),
+  },
+  async ({ database: dbName, collection: collectionName, pipeline }) => {
+    try {
+      const db = await ensureConnection(dbName);
+      const collection: Collection = db.collection(collectionName);
+      
+      const documents = await collection.aggregate(pipeline).toArray();
+      
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Aggregation returned ${documents.length} document(s):\n${JSON.stringify(documents, null, 2)}`,
+          },
+        ],
+      };
+    } catch (error) {
+      throw new Error(`Failed to execute aggregation: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  }
+);
+
+server.tool(
+  "mongo-count-documents",
+  "Count documents in a MongoDB collection",
+  {
+    database: z.string().describe("Database name"),
+    collection: z.string().describe("Collection name"),
+    filter: z.record(z.any()).optional().describe("Query filter as JSON object (optional)"),
+  },
+  async ({ database: dbName, collection: collectionName, filter = {} }) => {
+    try {
+      const db = await ensureConnection(dbName);
+      const collection: Collection = db.collection(collectionName);
+      
+      const count = await collection.countDocuments(filter);
+      
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Found ${count} document(s) matching the filter`,
+          },
+        ],
+      };
+    } catch (error) {
+      throw new Error(`Failed to count documents: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  }
+);
+
+server.tool(
+  "mongo-list-collections",
+  "List all collections in a MongoDB database",
+  {
+    database: z.string().describe("Database name"),
+  },
+  async ({ database: dbName }) => {
+    try {
+      const db = await ensureConnection(dbName);
+      
+      const collections = await db.listCollections().toArray();
+      const collectionNames = collections.map(col => col.name);
+      
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Collections in database '${dbName}':\n${collectionNames.join('\n')}`,
+          },
+        ],
+      };
+    } catch (error) {
+      throw new Error(`Failed to list collections: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  }
+);
+
 async function main() {
   try {
     const transport = new StdioServerTransport();
     await server.connect(transport);
-    console.error("MCP Hello World Server running...");
+    console.error("MongoDB MCP Server running...");
   } catch (error) {
     console.error("Error starting server:", error);
     process.exit(1);
